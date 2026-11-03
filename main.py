@@ -28,7 +28,11 @@ def ocr(data):
 
 @bot.message_handler(commands=["start", "help"])
 def start(m):
-    bot.reply_to(m, "📱 <b>DUPO SAMSUNG WARRANTY BOT</b>\\nGửi ảnh tem hộp Samsung rõ nét. Bot sẽ đọc model và IMEI.\\n\\n⚠️ Phiên bản này chỉ nhận diện tem, chưa truy vấn cơ sở dữ liệu bảo hành Samsung nên không xác nhận ngày kích hoạt/hạn bảo hành.")
+    log.info("START HANDLER: %s", m.text)
+    bot.reply_to(
+        m,
+        "📱 DUPO SAMSUNG WARRANTY BOT đang hoạt động!"
+    )
 
 @bot.message_handler(content_types=["photo"])
 def photo(m):
@@ -56,13 +60,9 @@ def photo(m):
 def health():
     return "DUPO Samsung Warranty Bot is running", 200
 
-@app.post("/telegram/" + WEBHOOK_SECRET)
-def webhook():
-    if not request.is_json:
-        abort(400)
-    update = telebot.types.Update.de_json(request.get_json())
-    bot.process_new_updates([update])
-    return "ok", 200
+200
+
+
 
 # Register Telegram webhook when the Render service starts.
 bot.remove_webhook()
