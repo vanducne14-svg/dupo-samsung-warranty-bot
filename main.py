@@ -1,168 +1,200 @@
-import logging, os, re
+import os
+import re
+import time
+import threading
+import logging
 from io import BytesIO
 
-import pytesseract
 import requests
-from flask import Flask, abort, jsonify, request
-from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+import pytesseract
+from PIL import Image, ImageOps, ImageEnhance
+from flask import Flask, jsonify, request
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(message)s"
+)
 log = logging.getLogger("dupo-warranty")
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-PUBLIC_URL = os.environ.get("PUBLIC_URL", "").strip().rstrip("/")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
+PORT = int(os.getenv("PORT", "10000"))
 
-if not BOT_TOKEN:
-    raise RuntimeError("Thiếu BOT_TOKEN trong Render Environment.")
-if not PUBLIC_URL.startswith("https://"):
-    raise RuntimeError("PUBLIC_URL phải là URL HTTPS của Render.")
-if not WEBHOOK_SECRET:
-    raise RuntimeError("Thiếu WEBHOOK_SECRET trong Render Environment.")
-
-API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
-WEBHOOK_URL = f"{PUBLIC_URL}/telegram"
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 12 * 1024 * 1024
+polling_started = False
+polling_lock = threading.Lock()
 
-def tg(method, payload=None, timeout=30):
-    r = requests.post(f"{API}/{method}", json=payload or {}, timeout=timeout)
-    r.raise_for_status()
-    data = r.json()
-    if not data.get("ok"):
-        raise RuntimeError(f"Telegram {method} failed: {data}")
-    return data.get("result")
+
+def telegram(method, data=None, files=None, timeout=40):
+    if not BOT_TOKEN:
+        raise RuntimeError("Thiếu biến môi trường BOT_TOKEN")
+    response = requests.post(
+        f"{API}/{method}",
+        data=data or {},
+        files=files,
+        timeout=timeout
+    )
+    try:
+        payload = response.json()
+    except Exception:
+        raise RuntimeError(f"Telegram trả về HTTP {response.status_code}")
+    if not response.ok or not payload.get("ok"):
+        # Do not log token or full API URL.
+        description = payload.get("description", "Telegram API error")
+        raise RuntimeError(f"Telegram {method}: {description}")
+    return payload.get("result")
+
 
 def send_text(chat_id, text, reply_to=None):
-    data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML",
-            "disable_web_page_preview": True}
+    data = {"chat_id": chat_id, "text": text}
     if reply_to:
         data["reply_to_message_id"] = reply_to
-    return tg("sendMessage", data)
+    telegram("sendMessage", data=data)
 
-def download_telegram_file(file_id):
-    info = tg("getFile", {"file_id": file_id})
-    path = info.get("file_path")
-    if not path:
-        raise RuntimeError("Telegram không trả file_path.")
-    r = requests.get(f"{FILE_API}/{path}", timeout=45)
-    r.raise_for_status()
-    return r.content
 
-def read_image(image_bytes):
-    im = ImageOps.exif_transpose(Image.open(BytesIO(image_bytes))).convert("RGB")
-    w, h = im.size
-    scale = min(3.0, max(1.5, 1800 / max(w, h)))
-    if scale > 1:
-        im = im.resize((int(w * scale), int(h * scale)))
-    im = ImageOps.grayscale(im)
-    im = ImageOps.autocontrast(im)
-    im = ImageEnhance.Contrast(im).enhance(1.5)
-    im = im.filter(ImageFilter.SHARPEN)
-    return pytesseract.image_to_string(im, lang="eng", config="--oem 3 --psm 6")
+def get_file_bytes(file_id):
+    info = telegram("getFile", data={"file_id": file_id})
+    file_path = info.get("file_path")
+    if not file_path:
+        raise RuntimeError("Telegram không trả về đường dẫn ảnh")
+    response = requests.get(
+        f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}",
+        timeout=45
+    )
+    response.raise_for_status()
+    return response.content
 
-def get_model(text):
-    m = re.search(r"\bSM[\s\-]?[A-Z0-9]{4,10}\b", text, re.I)
-    if m:
-        return re.sub(r"[\s]", "", m.group(0).upper()).replace("SM", "SM-", 1).replace("SM--", "SM-")
-    return None
 
-def get_imeis(text):
-    matches = re.findall(r"(?<!\d)(?:\d[\s\-]?){14}\d(?!\d)", text)
-    found = []
-    for item in matches:
-        digits = re.sub(r"\D", "", item)
-        if len(digits) == 15 and digits not in found:
-            found.append(digits)
-    return found[:2]
+def ocr_image(raw):
+    image = Image.open(BytesIO(raw)).convert("RGB")
+    image = ImageOps.grayscale(image)
+    image = ImageOps.autocontrast(image)
+    image = ImageEnhance.Contrast(image).enhance(1.6)
+    # Upscale small label photos to improve OCR.
+    if image.width < 1800:
+        scale = min(3, 1800 / max(image.width, 1))
+        image = image.resize((int(image.width * scale), int(image.height * scale)))
+    return pytesseract.image_to_string(image, lang="eng", config="--psm 6")
 
-def make_result(text):
-    model, imeis = get_model(text), get_imeis(text)
-    lines = ["📱 <b>DUPO – KẾT QUẢ ĐỌC THÔNG TIN SAMSUNG</b>", ""]
-    lines.append(f"• Model: <code>{model}</code>" if model else "• Model: Chưa nhận diện được")
-    if imeis:
-        lines.extend(f"• IMEI {i}: <code>{v}</code>" for i, v in enumerate(imeis, 1))
-    else:
-        lines.append("• IMEI: Chưa đọc được")
-    lines += ["", "🛡️ <b>Bảo hành:</b> Chưa tra cứu trên hệ thống Samsung.",
-              "ℹ️ Phiên bản này đọc thông tin trên ảnh, chưa kết nối hệ thống bảo hành chính thức của Samsung."]
-    if not model and not imeis:
-        lines += ["", "⚠️ Ảnh chưa đủ rõ. Hãy chụp thẳng tem hộp, đủ sáng và không bị lóa."]
-    return "\n".join(lines)
 
-def handle_message(msg):
-    chat_id = (msg.get("chat") or {}).get("id")
+def extract_data(text):
+    normalized = text.upper().replace(" ", "").replace("-", "")
+    models = sorted(set(re.findall(r"SM[A-Z0-9]{5,}", normalized)))
+    # IMEI is exactly 15 digits. Ignore duplicates.
+    imeis = []
+    for value in re.findall(r"(?<!\d)\d{15}(?!\d)", text):
+        if value not in imeis:
+            imeis.append(value)
+    return models[:5], imeis[:2]
+
+
+def help_text():
+    return (
+        "📱 SAMSUNG WARRANTY DUPO\n\n"
+        "Gửi ảnh tem hộp Samsung rõ nét, bot sẽ đọc Model và IMEI.\n"
+        "Có thể gửi ảnh dưới dạng Ảnh hoặc Tệp.\n\n"
+        "Lưu ý: Bot chỉ đọc thông tin trên tem, chưa tra cứu ngày bảo hành "
+        "trên hệ thống Samsung."
+    )
+
+
+def handle_message(message):
+    chat = message.get("chat", {})
+    chat_id = chat.get("id")
+    message_id = message.get("message_id")
     if not chat_id:
         return
-    message_id = msg.get("message_id")
-    text = (msg.get("text") or msg.get("caption") or "").strip()
 
-    if text.startswith("/start"):
-        send_text(chat_id,
-            "👋 Chào mừng đến với <b>Samsung Warranty DUPO</b>!\n\n"
-            "📸 Gửi ảnh tem hộp Samsung, bot sẽ tự đọc Model và IMEI.\n"
-            "Dùng /help để xem hướng dẫn.", message_id)
-        return
-    if text.startswith("/help"):
-        send_text(chat_id,
-            "📌 <b>HƯỚNG DẪN</b>\n1. Chụp rõ tem hộp Samsung.\n"
-            "2. Gửi ảnh vào đây.\n3. Bot đọc Model và tối đa 2 IMEI.\n\n"
-            "Ảnh cần đủ sáng, không lóa và không cắt mất dãy số.", message_id)
+    text = (message.get("text") or "").strip()
+    if text.startswith("/start") or text.startswith("/help"):
+        send_text(chat_id, help_text(), message_id)
         return
 
-    photos = msg.get("photo") or []
-    doc = msg.get("document") or {}
-    file_id = photos[-1].get("file_id") if photos else None
-    if not file_id and doc.get("mime_type", "").startswith("image/"):
-        file_id = doc.get("file_id")
+    file_id = None
+    photos = message.get("photo") or []
+    if photos:
+        file_id = photos[-1].get("file_id")
+    elif message.get("document"):
+        doc = message["document"]
+        mime = (doc.get("mime_type") or "").lower()
+        name = (doc.get("file_name") or "").lower()
+        if mime.startswith("image/") or name.endswith((".jpg", ".jpeg", ".png", ".webp")):
+            file_id = doc.get("file_id")
 
     if not file_id:
-        if text:
-            send_text(chat_id, "Bạn hãy gửi <b>ảnh tem hộp Samsung</b> để bot đọc Model và IMEI. Gõ /help để xem hướng dẫn.", message_id)
+        send_text(chat_id, "Bạn hãy gửi ảnh tem hộp Samsung (ảnh rõ, đủ sáng) để mình đọc Model và IMEI nhé.", message_id)
         return
 
-    send_text(chat_id, "🔎 Đang đọc ảnh, vui lòng chờ...", message_id)
+    send_text(chat_id, "🔎 Đang đọc tem máy, vui lòng chờ...", message_id)
     try:
-        ocr = read_image(download_telegram_file(file_id))
-        result = make_result(ocr)
-        send_text(chat_id, result)
-        log.info("OCR completed; model=%s; imeis=%s", bool(get_model(ocr)), len(get_imeis(ocr)))
+        raw = get_file_bytes(file_id)
+        recognized = ocr_image(raw)
+        models, imeis = extract_data(recognized)
+
+        lines = ["📱 KẾT QUẢ ĐỌC TEM SAMSUNG", ""]
+        lines.append("Model: " + ("\n".join(models) if models else "Chưa đọc rõ"))
+        lines.append("")
+        if imeis:
+            lines.append("IMEI:")
+            lines.extend(f"{i+1}. {value}" for i, value in enumerate(imeis))
+        else:
+            lines.append("IMEI: Chưa đọc rõ")
+        lines += ["", "Bảo hành: Chưa tra cứu trên hệ thống Samsung."]
+        lines += ["", "Nếu thông tin chưa chính xác, vui lòng chụp lại tem thẳng, rõ nét và không lóa sáng."]
+        send_text(chat_id, "\n".join(lines))
+    except Exception as exc:
+        log.exception("Xử lý ảnh thất bại")
+        send_text(chat_id, f"❌ Chưa đọc được ảnh. Vui lòng gửi ảnh rõ hơn.\nChi tiết: {str(exc)[:180]}")
+
+
+def polling_loop():
+    log.info("Bắt đầu Telegram long polling")
+    # Remove any old webhook; long polling and webhook cannot run together.
+    try:
+        telegram("deleteWebhook", data={"drop_pending_updates": "false"})
+        log.info("Đã xóa webhook cũ (nếu có)")
     except Exception:
-        log.exception("PHOTO_PROCESSING_FAILED")
-        send_text(chat_id, "❌ Chưa đọc được ảnh. Vui lòng gửi lại ảnh rõ hơn, chụp thẳng tem hộp và tránh phản chiếu ánh sáng.")
+        log.exception("Không xóa được webhook cũ")
+        time.sleep(10)
+
+    offset = None
+    while True:
+        try:
+            params = {"timeout": 25, "allowed_updates": '["message"]'}
+            if offset is not None:
+                params["offset"] = offset
+            updates = telegram("getUpdates", data=params, timeout=35)
+            for update in updates or []:
+                offset = update["update_id"] + 1
+                message = update.get("message")
+                if message:
+                    try:
+                        handle_message(message)
+                    except Exception:
+                        log.exception("Lỗi xử lý tin nhắn")
+        except Exception:
+            log.exception("Long polling gặp lỗi; sẽ thử lại sau 5 giây")
+            time.sleep(5)
+
 
 @app.get("/")
-def home():
-    return "DUPO Samsung Warranty Bot v2 is running", 200
-
 @app.get("/health")
 def health():
-    return jsonify(status="ok", service="dupo-samsung-warranty-bot", version="2.0")
+    return jsonify(status="ok", service="Samsung Warranty DUPO", mode="long-polling")
 
-@app.post("/telegram")
-def webhook():
-    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    if secret != WEBHOOK_SECRET:
-        abort(403)
-    update = request.get_json(silent=True)
-    if not isinstance(update, dict):
-        return jsonify(ok=False, error="invalid_json"), 400
-    msg = update.get("message")
-    if msg:
-        try:
-            handle_message(msg)
-        except Exception:
-            log.exception("UPDATE_HANDLER_FAILED")
-    return jsonify(ok=True), 200
 
-def register_webhook():
-    result = tg("setWebhook", {
-        "url": WEBHOOK_URL,
-        "secret_token": WEBHOOK_SECRET,
-        "allowed_updates": ["message"],
-        "drop_pending_updates": False
-    })
-    log.info("WEBHOOK_REGISTERED result=%s url=%s", result, WEBHOOK_URL)
+def start_polling_once():
+    global polling_started
+    with polling_lock:
+        if polling_started:
+            return
+        polling_started = True
+        thread = threading.Thread(target=polling_loop, daemon=True, name="telegram-polling")
+        thread.start()
 
-register_webhook()
+
+if __name__ == "__main__":
+    if not BOT_TOKEN:
+        raise SystemExit("Thiếu BOT_TOKEN trong Environment của Render")
+    start_polling_once()
+    app.run(host="0.0.0.0", port=PORT, use_reloader=False)
