@@ -1,278 +1,168 @@
-
-import os
-import re
-import json
-import logging
+import logging, os, re
 from io import BytesIO
 
-from flask import Flask, request, abort
-from PIL import Image, ImageOps, ImageEnhance
 import pytesseract
-import telebot
+import requests
+from flask import Flask, abort, jsonify, request
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 
-# =====================================
-# 1. CONFIGURATION
-# =====================================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("dupo-warranty")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s"
-)
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "").strip().rstrip("/")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
 
-log = logging.getLogger("dupo")
+if not BOT_TOKEN:
+    raise RuntimeError("Thiếu BOT_TOKEN trong Render Environment.")
+if not PUBLIC_URL.startswith("https://"):
+    raise RuntimeError("PUBLIC_URL phải là URL HTTPS của Render.")
+if not WEBHOOK_SECRET:
+    raise RuntimeError("Thiếu WEBHOOK_SECRET trong Render Environment.")
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-PUBLIC_URL = os.environ["PUBLIC_URL"].rstrip("/")
-WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
-
-bot = telebot.TeleBot(
-    BOT_TOKEN,
-    parse_mode="HTML"
-)
-
+API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
+WEBHOOK_URL = f"{PUBLIC_URL}/telegram"
 app = Flask(__name__)
+app.config["MAX_CONTENT_LENGTH"] = 12 * 1024 * 1024
 
-# =====================================
-# 2. REGEX NHAN DIEN MODEL VA IMEI
-# =====================================
+def tg(method, payload=None, timeout=30):
+    r = requests.post(f"{API}/{method}", json=payload or {}, timeout=timeout)
+    r.raise_for_status()
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram {method} failed: {data}")
+    return data.get("result")
 
-MODEL_RE = re.compile(
-    r"\bSM[- ]?[A-Z0-9]{4,}(?:/[A-Z0-9]+)?\b",
-    re.IGNORECASE
-)
+def send_text(chat_id, text, reply_to=None):
+    data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML",
+            "disable_web_page_preview": True}
+    if reply_to:
+        data["reply_to_message_id"] = reply_to
+    return tg("sendMessage", data)
 
-IMEI_RE = re.compile(
-    r"(?<!\d)(?:\d[\s-]?){14}\d(?!\d)"
-)
+def download_telegram_file(file_id):
+    info = tg("getFile", {"file_id": file_id})
+    path = info.get("file_path")
+    if not path:
+        raise RuntimeError("Telegram không trả file_path.")
+    r = requests.get(f"{FILE_API}/{path}", timeout=45)
+    r.raise_for_status()
+    return r.content
 
-# =====================================
-# 3. DOC ANH BANG OCR
-# =====================================
-
-def ocr(data):
-    im = Image.open(BytesIO(data)).convert("RGB")
-
+def read_image(image_bytes):
+    im = ImageOps.exif_transpose(Image.open(BytesIO(image_bytes))).convert("RGB")
     w, h = im.size
-
-    if max(w, h) < 1800:
-        scale = min(3, 1800 / max(w, h))
-        im = im.resize(
-            (int(w * scale), int(h * scale))
-        )
-
+    scale = min(3.0, max(1.5, 1800 / max(w, h)))
+    if scale > 1:
+        im = im.resize((int(w * scale), int(h * scale)))
     im = ImageOps.grayscale(im)
-    im = ImageEnhance.Contrast(im).enhance(2.0)
-    im = ImageEnhance.Sharpness(im).enhance(2.0)
+    im = ImageOps.autocontrast(im)
+    im = ImageEnhance.Contrast(im).enhance(1.5)
+    im = im.filter(ImageFilter.SHARPEN)
+    return pytesseract.image_to_string(im, lang="eng", config="--oem 3 --psm 6")
 
-    return pytesseract.image_to_string(
-        im,
-        config="--psm 6"
-    )
+def get_model(text):
+    m = re.search(r"\bSM[\s\-]?[A-Z0-9]{4,10}\b", text, re.I)
+    if m:
+        return re.sub(r"[\s]", "", m.group(0).upper()).replace("SM", "SM-", 1).replace("SM--", "SM-")
+    return None
 
+def get_imeis(text):
+    matches = re.findall(r"(?<!\d)(?:\d[\s\-]?){14}\d(?!\d)", text)
+    found = []
+    for item in matches:
+        digits = re.sub(r"\D", "", item)
+        if len(digits) == 15 and digits not in found:
+            found.append(digits)
+    return found[:2]
 
-# =====================================
-# 4. START / HELP
-# =====================================
+def make_result(text):
+    model, imeis = get_model(text), get_imeis(text)
+    lines = ["📱 <b>DUPO – KẾT QUẢ ĐỌC THÔNG TIN SAMSUNG</b>", ""]
+    lines.append(f"• Model: <code>{model}</code>" if model else "• Model: Chưa nhận diện được")
+    if imeis:
+        lines.extend(f"• IMEI {i}: <code>{v}</code>" for i, v in enumerate(imeis, 1))
+    else:
+        lines.append("• IMEI: Chưa đọc được")
+    lines += ["", "🛡️ <b>Bảo hành:</b> Chưa tra cứu trên hệ thống Samsung.",
+              "ℹ️ Phiên bản này đọc thông tin trên ảnh, chưa kết nối hệ thống bảo hành chính thức của Samsung."]
+    if not model and not imeis:
+        lines += ["", "⚠️ Ảnh chưa đủ rõ. Hãy chụp thẳng tem hộp, đủ sáng và không bị lóa."]
+    return "\n".join(lines)
 
-@bot.message_handler(commands=["start", "help"])
-def start(m):
-    log.info("START HANDLER: %s", m.text)
+def handle_message(msg):
+    chat_id = (msg.get("chat") or {}).get("id")
+    if not chat_id:
+        return
+    message_id = msg.get("message_id")
+    text = (msg.get("text") or msg.get("caption") or "").strip()
 
-    bot.reply_to(
-        m,
-        "📱 <b>DUPO SAMSUNG WARRANTY BOT</b>\n\n"
-        "Bot đang hoạt động!\n\n"
-        "📸 Gửi ảnh tem hộp Samsung để nhận diện:\n"
-        "• Model máy\n"
-        "• IMEI 1\n"
-        "• IMEI 2\n\n"
-        "Hãy chụp rõ tem hộp, đủ ánh sáng."
-    )
+    if text.startswith("/start"):
+        send_text(chat_id,
+            "👋 Chào mừng đến với <b>Samsung Warranty DUPO</b>!\n\n"
+            "📸 Gửi ảnh tem hộp Samsung, bot sẽ tự đọc Model và IMEI.\n"
+            "Dùng /help để xem hướng dẫn.", message_id)
+        return
+    if text.startswith("/help"):
+        send_text(chat_id,
+            "📌 <b>HƯỚNG DẪN</b>\n1. Chụp rõ tem hộp Samsung.\n"
+            "2. Gửi ảnh vào đây.\n3. Bot đọc Model và tối đa 2 IMEI.\n\n"
+            "Ảnh cần đủ sáng, không lóa và không cắt mất dãy số.", message_id)
+        return
 
+    photos = msg.get("photo") or []
+    doc = msg.get("document") or {}
+    file_id = photos[-1].get("file_id") if photos else None
+    if not file_id and doc.get("mime_type", "").startswith("image/"):
+        file_id = doc.get("file_id")
 
-# =====================================
-# 5. NHAN DIEN ANH TEM HOP
-# =====================================
+    if not file_id:
+        if text:
+            send_text(chat_id, "Bạn hãy gửi <b>ảnh tem hộp Samsung</b> để bot đọc Model và IMEI. Gõ /help để xem hướng dẫn.", message_id)
+        return
 
-@bot.message_handler(content_types=["photo"])
-def photo(m):
-
-    msg = bot.reply_to(
-        m,
-        "🔎 Đang đọc tem hộp Samsung..."
-    )
-
+    send_text(chat_id, "🔎 Đang đọc ảnh, vui lòng chờ...", message_id)
     try:
-        file_info = bot.get_file(
-            m.photo[-1].file_id
-        )
-
-        raw = bot.download_file(
-            file_info.file_path
-        )
-
-        text = ocr(raw)
-
-        log.info("OCR TEXT: %s", text)
-
-        # Nhận diện model
-        models = list(dict.fromkeys(
-            MODEL_RE.findall(text)
-        ))
-
-        # Nhận diện IMEI
-        imeis = []
-
-        labeled = re.findall(
-            r"IMEI\s*[12]?\s*[:\-]?\s*((?:\d[\s-]?){15})",
-            text,
-            re.IGNORECASE
-        )
-
-        for value in labeled:
-            number = re.sub(r"\D", "", value)
-            if len(number) == 15 and number not in imeis:
-                imeis.append(number)
-
-        if not imeis:
-            candidates = IMEI_RE.findall(text)
-
-            for value in candidates:
-                number = re.sub(r"\D", "", value)
-
-                if len(number) == 15 and number not in imeis:
-                    imeis.append(number)
-
-        # Tạo kết quả
-        out = [
-            "📷 <b>KẾT QUẢ NHẬN DIỆN TEM HỘP</b>",
-            ""
-        ]
-
-        if models:
-            out.append(
-                "📱 <b>Model:</b> " + ", ".join(models)
-            )
-        else:
-            out.append(
-                "📱 <b>Model:</b> Chưa nhận diện được"
-            )
-
-        out.append("")
-
-        if imeis:
-            out.append(
-                f"✅ <b>Đã nhận diện {len(imeis)} IMEI:</b>"
-            )
-
-            for i, value in enumerate(imeis, 1):
-                out.append(
-                    f"{i}. <code>{value}</code>"
-                )
-        else:
-            out.append(
-                "⚠️ Chưa đọc được IMEI 15 số. "
-                "Vui lòng chụp rõ tem hộp hơn."
-            )
-
-        out += [
-            "",
-            "🛡️ <b>Bảo hành:</b> Chưa tra cứu "
-            "trên hệ thống Samsung.",
-            "",
-            "DUPO TECH"
-        ]
-
-        bot.edit_message_text(
-            "\n".join(out),
-            chat_id=m.chat.id,
-            message_id=msg.message_id
-        )
-
-        log.info("PHOTO HANDLER COMPLETED")
-
+        ocr = read_image(download_telegram_file(file_id))
+        result = make_result(ocr)
+        send_text(chat_id, result)
+        log.info("OCR completed; model=%s; imeis=%s", bool(get_model(ocr)), len(get_imeis(ocr)))
     except Exception:
-        log.exception("OCR ERROR")
-
-        bot.edit_message_text(
-            "❌ Không xử lý được ảnh.\n"
-            "Vui lòng thử lại hoặc gửi ảnh rõ hơn.",
-            chat_id=m.chat.id,
-            message_id=msg.message_id
-        )
-
-
-# =====================================
-# 6. HEALTH CHECK
-# =====================================
+        log.exception("PHOTO_PROCESSING_FAILED")
+        send_text(chat_id, "❌ Chưa đọc được ảnh. Vui lòng gửi lại ảnh rõ hơn, chụp thẳng tem hộp và tránh phản chiếu ánh sáng.")
 
 @app.get("/")
+def home():
+    return "DUPO Samsung Warranty Bot v2 is running", 200
+
+@app.get("/health")
 def health():
-    return "DUPO Samsung Warranty Bot is running", 200
+    return jsonify(status="ok", service="dupo-samsung-warranty-bot", version="2.0")
 
-
-# =====================================
-# 7. TELEGRAM WEBHOOK
-# =====================================
-
-@app.post("/telegram/" + WEBHOOK_SECRET)
+@app.post("/telegram")
 def webhook():
+    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if secret != WEBHOOK_SECRET:
+        abort(403)
+    update = request.get_json(silent=True)
+    if not isinstance(update, dict):
+        return jsonify(ok=False, error="invalid_json"), 400
+    msg = update.get("message")
+    if msg:
+        try:
+            handle_message(msg)
+        except Exception:
+            log.exception("UPDATE_HANDLER_FAILED")
+    return jsonify(ok=True), 200
 
-    try:
-        data = request.get_json(silent=True)
+def register_webhook():
+    result = tg("setWebhook", {
+        "url": WEBHOOK_URL,
+        "secret_token": WEBHOOK_SECRET,
+        "allowed_updates": ["message"],
+        "drop_pending_updates": False
+    })
+    log.info("WEBHOOK_REGISTERED result=%s url=%s", result, WEBHOOK_URL)
 
-        if not data:
-            log.error("WEBHOOK: No JSON")
-            abort(400)
-
-        update = telebot.types.Update.de_json(
-            json.dumps(data)
-        )
-
-        log.info(
-            "WEBHOOK RECEIVED update_id=%s",
-            update.update_id
-        )
-
-        bot.process_new_updates([update])
-
-        log.info("WEBHOOK PROCESSED")
-
-        return "ok", 200
-
-    except Exception:
-        log.exception("WEBHOOK ERROR")
-        return "error", 500
-
-
-# =====================================
-# 8. REGISTER TELEGRAM WEBHOOK
-# =====================================
-
-WEBHOOK_URL = (
-    f"{PUBLIC_URL}/telegram/{WEBHOOK_SECRET}"
-)
-
-try:
-    bot.remove_webhook()
-
-    result = bot.set_webhook(
-        url=WEBHOOK_URL,
-        allowed_updates=["message"]
-    )
-
-    log.info("WEBHOOK REGISTERED: %s", result)
-
-except Exception:
-    log.exception("WEBHOOK REGISTRATION FAILED")
-
-
-# =====================================
-# 9. START APPLICATION
-# =====================================
-
-if __name__ == "__main__":
-    app.run(
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 10000))
-    )
+register_webhook()
